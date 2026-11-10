@@ -43,11 +43,11 @@ def build_parser(task="vlm", algorithm=None):
     """Generate training flags from the same dataclasses notebooks use."""
     algorithm, (_, config_type) = task_spec(task, algorithm)
     parser = argparse.ArgumentParser(description=f"MLX {task}/{algorithm} training")
-    parser.add_argument("--task", choices=("vlm",), default=task)
+    parser.add_argument("--task", choices=("vlm", "asr"), default=task)
     parser.add_argument(
         "--algorithm",
         "--train-mode",
-        choices=("sft", "uft", "orpo", "dpo", "grpo"),
+        choices=("sft", "uft", "orpo", "dpo", "grpo", "ctc"),
         default=algorithm,
     )
     parser.add_argument("-c", "--config")
@@ -267,7 +267,7 @@ def parse_args(argv=None, *, task="vlm"):
             "beta1, beta2, optimizer_eps and bias_correction need adam or adamw."
         )
     try:
-        config = resolve_schedule_config(
+        schedule = resolve_schedule_config(
             args.lr_schedule,
             learning_rate=args.learning_rate,
             total_updates=10**9,
@@ -275,8 +275,8 @@ def parse_args(argv=None, *, task="vlm"):
             warmup_init=args.warmup_init,
             min_learning_rate=args.min_learning_rate,
         )
-        if config is not None:
-            build_schedule(config)
+        if schedule is not None:
+            build_schedule(schedule)
     except (ValueError, TypeError) as error:
         parser.error(str(error))
     _, (_, config_type) = task_spec(args.task, args.algorithm)
@@ -295,6 +295,12 @@ def parse_args(argv=None, *, task="vlm"):
 
 def _load_model(task, path):
     """Keep upstream loaders here so future mlx-omni integration changes one place."""
+    if task == "asr":
+        from mlx_audio.stt import load
+
+        model = load(path)
+        # Some loaders return an inference facade around the trainable module.
+        return getattr(model, "_model", model), None
     from mlx_vlm import load
 
     return load(path)
@@ -410,7 +416,7 @@ def run(args, settings, training_callback=None):
     if len(train_rows) == 0:
         raise ValueError(f"Dataset has no non-empty {args.train_split!r} split.")
     head = None
-    if settings.mtp_loss_weight:
+    if getattr(settings, "mtp_loss_weight", 0):
         if not args.mtp_model:
             raise ValueError("--mtp-loss-weight requires --mtp-model.")
         from .speculative.drafters import load_drafter

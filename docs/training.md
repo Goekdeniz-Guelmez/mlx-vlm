@@ -373,12 +373,90 @@ Callbacks implement `TrainingCallback.on_train_loss_report` and
 `on_val_loss_report`. Pass a callback through `training_callback`, or use
 `--wandb project` after installing the optional `wandb` package.
 
+## ASR training
+
+`--task asr` trains speech recognition models loaded with `mlx-audio`
+(`pip install mlx-audio`). Two objectives share the engine, optimizer flags,
+LoRA/DoRA/full modes, and checkpoints with VLM training:
+
+| Algorithm | Objective | Built-in models |
+|---|---|---|
+| `sft` (default) | Next-token cross-entropy on transcript tokens | Qwen3-ASR, Whisper |
+| `ctc` | Connectionist Temporal Classification on frame logits | Parakeet CTC and TDT-CTC |
+
+```sh
+python -m mlx_vlm.train --task asr \
+  --model mlx-community/whisper-tiny-asr-fp16 \
+  --data Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo --learning-rate 1e-4
+
+python -m mlx_vlm.train --task asr --algorithm ctc \
+  --model mlx-community/parakeet-tdt_ctc-110m \
+  --data Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo --batch-size 2
+```
+
+Datasets use the shared speech layout: `train.jsonl`, `validation.jsonl`, and
+`test.jsonl` beside an `audio/` folder, one object per line, with audio paths
+relative to the dataset root. `language` is optional (default
+`--dataset-config '{"language": "en"}'`).
+
+```json
+{"audio": "audio/train/000001.wav", "text": "Hello, how are you?", "language": "en"}
+```
+
+```python
+import mlx.optimizers as optim
+from mlx_audio.stt import load
+from mlx_vlm.trainer import CTCTrainConfig, Trainer, prepare_model_for_training
+from mlx_vlm.trainer.datasets import load as load_rows
+
+rows = load_rows("Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo")
+model = prepare_model_for_training(load("mlx-community/parakeet-tdt_ctc-110m"))
+Trainer(
+    model, CTCTrainConfig(batch_size=2), task="asr",
+    train_dataset=rows["train"], eval_dataset=rows["validation"],
+    optimizer=optim.AdamW(learning_rate=1e-4),
+).train()
+```
+
+Loaders that return an inference facade (Qwen3-ASR) keep the trainable module
+in `model._model`; the CLI unwraps it.
+
+### Adding a model
+
+The objectives never name a model. An example is a mapping whose keys are the
+forward's argument names plus the supervision fields, and the trainer passes
+each batch field to the argument of the same name:
+
+- `sft`: unshifted `input_ids` and a `completion_mask` marking transcript
+  tokens; the forward returns logits `[batch, tokens, vocab]`.
+- `ctc`: `labels` and optionally `input_lengths` (unpadded audio length in any
+  unit, used to ignore padded frames); the forward returns `[batch, frames, vocab]`.
+
+A model whose `__call__` already takes named fields and returns logits trains
+with `processing_class=row -> example` (or `prepared=True`) and nothing else.
+Otherwise give it a bridge, either as a `model.asr_bridge(algorithm, config)`
+method or as one entry in `trainer/asr/models.py`:
+
+```python
+ASRBridge(
+    process=lambda row: {...},                 # speech row -> example
+    forward=lambda model, mel: model.logits(mel),  # only if __call__ is not logits
+    blank_id=1024,                             # CTC only
+)
+```
+
+Notes: audio-LLM models merge audio features by placeholder position, so keep
+`batch_size=1` unless the model masks padded audio. Half-precision checkpoints
+need `--optimizer-eps 1e-4` (or SGD) for `--train-type full` with Adam/AdamW.
+Parakeet TDT/RNN-T transducer objectives are not implemented.
+
 ## Backend structure and compatibility
 
 `trainer/common` owns configuration, model preparation, the shared engine,
 callbacks, and the `TrainingTask` contract. `trainer/datasets/loading.py` owns
 JSONL loading and bounded caching. `trainer/vlm` owns VLM preprocessing and SFT,
-ORPO, and DPO objectives. `trainer/peft` uses MLX-VLM's local LoRA/DoRA layers.
+ORPO, and DPO objectives. `trainer/asr` owns the ASR objectives and model
+bridges. `trainer/peft` uses MLX-VLM's local LoRA/DoRA layers.
 The registry in `trainer/api.py` selects the supported VLM tasks; a custom
 `TrainingTask` can be passed directly to `Trainer`.
 

@@ -128,12 +128,15 @@ def vlm_sft_loss(
     train_on_completions: bool = False,
     assistant_id: int | None = 77091,
     mtp_loss_weight: float = 0.0,
+    forward: Callable = _forward_vlm,
 ) -> tuple[mx.array, dict[str, mx.array]]:
     """Compute masked causal cross-entropy for a VLM batch.
 
     The batch stores unshifted ``input_ids``. The model receives all but the
     last token and predicts the remaining targets. Padding and (optionally)
     prompt tokens are excluded from the shared cross-entropy objective.
+    ``forward(model, input_ids, attention_mask, batch, **kwargs)`` lets other
+    modalities reuse this objective with their own model call.
     """
     if not math.isfinite(mtp_loss_weight) or mtp_loss_weight < 0:
         raise ValueError("mtp_loss_weight must be finite and non-negative.")
@@ -166,12 +169,12 @@ def vlm_sft_loss(
             raise ValueError(
                 "MTP loss requires attach_mtp_head(model, head) before training."
             )
-        output = _forward_vlm(
+        output = forward(
             model, input_ids, model_attention_mask, batch, return_hidden=True
         )
-        logits = _logits_from_output(output).astype(mx.float32)
     else:
-        logits = forward_vlm_logits(model, input_ids, model_attention_mask, batch)
+        output = forward(model, input_ids, model_attention_mask, batch)
+    logits = _logits_from_output(output).astype(mx.float32)
     if logits.ndim != 3 or logits.shape[:-1] != targets.shape:
         raise ValueError(
             "VLM logits must align position-for-position with shifted targets; "
@@ -595,8 +598,12 @@ def make_task(
     *,
     loss_fn=vlm_sft_loss,
     iterate_batches=iterate_vlm_batches,
+    dataset_factory=None,
 ):
-    """Bind VLM preprocessing and supervised cross-entropy."""
+    """Bind preprocessing and supervised cross-entropy.
+
+    ``dataset_factory(rows)`` replaces VLM preprocessing for other modalities.
+    """
     from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
 
     loss_options = dict(
@@ -612,8 +619,11 @@ def make_task(
 
     return _make_vlm_task(
         args,
-        lambda rows: VisionDataset(
-            rows, model.config, processing_class, config=dataset_config or args
+        dataset_factory
+        or (
+            lambda rows: VisionDataset(
+                rows, model.config, processing_class, config=dataset_config or args
+            )
         ),
         loss_fn=partial(loss_fn, **loss_options),
         iterate_batches=iterate_batches,

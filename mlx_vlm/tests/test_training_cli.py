@@ -75,7 +75,7 @@ def test_optimizer_cli_settings_are_separate_from_training_arguments(
     "flags",
     [
         ["--iters", "1", "--epochs", "2"],
-        ["--task", "asr"],
+        ["--task", "tts"],
         ["--algorithm", "infonce"],
         ["--dataset-config", "[]"],
         ["--reference-model", "unused"],
