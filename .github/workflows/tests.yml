@@ -101,6 +101,7 @@ jobs:
             tests: >-
               tests/test_training_api.py
               tests/test_training_asr.py
+              tests/test_training_asr_normalize.py
               tests/test_cache.py
               tests/test_model_ops.py
               tests/test_moe_offload.py

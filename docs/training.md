@@ -376,20 +376,21 @@ Callbacks implement `TrainingCallback.on_train_loss_report` and
 ## ASR training
 
 `--task asr` trains speech recognition models loaded with `mlx-audio`
-(`pip install mlx-audio`). Two objectives share the engine, optimizer flags,
-LoRA/DoRA/full modes, and checkpoints with VLM training:
+(`pip install mlx-audio`). The engine, optimizer flags, LoRA/DoRA/full modes,
+and checkpoints are the ones VLM training uses. The model decides the
+objective, so there is no algorithm to choose:
 
-| Algorithm | Objective | Built-in models |
+| Objective | Loss | Normalized families |
 |---|---|---|
-| `sft` (default) | Next-token cross-entropy on transcript tokens | Qwen3-ASR, Whisper |
-| `ctc` | Connectionist Temporal Classification on frame logits | Parakeet CTC and TDT-CTC |
+| `sft` | Next-token cross-entropy on transcript tokens | Whisper, Qwen3-ASR (and Mega-ASR, Phonon), Qwen2-Audio, Voxtral, Granite Speech, GLM-ASR, Fun-ASR Nano, Moonshine, Canary, Cohere ASR, FireRedASR2, MOSS Transcribe, VibeVoice ASR, Higgs Audio 3 |
+| `ctc` | Connectionist Temporal Classification on frame logits | Parakeet CTC and TDT-CTC, MMS, Granite Speech CTC, SenseVoice |
 
 ```sh
 python -m mlx_vlm.train --task asr \
   --model mlx-community/whisper-tiny-asr-fp16 \
   --data Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo --learning-rate 1e-4
 
-python -m mlx_vlm.train --task asr --algorithm ctc \
+python -m mlx_vlm.train --task asr \
   --model mlx-community/parakeet-tdt_ctc-110m \
   --data Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo --batch-size 2
 ```
@@ -406,49 +407,46 @@ relative to the dataset root. `language` is optional (default
 ```python
 import mlx.optimizers as optim
 from mlx_audio.stt import load
-from mlx_vlm.trainer import CTCTrainConfig, Trainer, prepare_model_for_training
+from mlx_vlm.trainer import SFTTrainConfig, Trainer, prepare_model_for_training
+from mlx_vlm.trainer.asr.normalize import normalize_model
 from mlx_vlm.trainer.datasets import load as load_rows
 
 rows = load_rows("Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo")
-model = prepare_model_for_training(load("mlx-community/parakeet-tdt_ctc-110m"))
+model = normalize_model(load("mlx-community/parakeet-tdt_ctc-110m"))
+model = prepare_model_for_training(model)
 Trainer(
-    model, CTCTrainConfig(batch_size=2), task="asr",
+    model, SFTTrainConfig(batch_size=2), task="asr",
     train_dataset=rows["train"], eval_dataset=rows["validation"],
     optimizer=optim.AdamW(learning_rate=1e-4),
 ).train()
 ```
 
-Loaders that return an inference facade (Qwen3-ASR) keep the trainable module
-in `model._model`; the CLI unwraps it.
+### Model normalization
 
-### Adding a model
+Speech models expose different inference interfaces, so
+`trainer/asr/normalize.py` inspects a loaded model and attaches one training
+interface. The rest of the trainer only uses that interface:
 
-The objectives never name a model. An example is a mapping whose keys are the
-forward's argument names plus the supervision fields, and the trainer passes
-each batch field to the argument of the same name:
+- `training_objective`: `"sft"` or `"ctc"`.
+- `prepare_example(audio, text, language)`: one utterance as a mapping. Model
+  inputs are named after `forward_logits` arguments (the preprocessed audio is
+  always `input_features`); supervision is `input_ids` plus `completion_mask`
+  for `sft`, or `labels` for `ctc`.
+- `forward_logits(**inputs)`: differentiable logits for one example.
+- `blank_id`: the CTC blank class.
 
-- `sft`: unshifted `input_ids` and a `completion_mask` marking transcript
-  tokens; the forward returns logits `[batch, tokens, vocab]`.
-- `ctc`: `labels` and optionally `input_lengths` (unpadded audio length in any
-  unit, used to ignore padded frames); the forward returns `[batch, frames, vocab]`.
+`normalize_model` also unwraps inference facades to the module that owns the
+parameters. A model class that defines this interface itself is used as is, so
+it needs no entry. Any other architecture needs one small family class in
+`normalize.py`; subclasses of a known family are covered automatically.
 
-A model whose `__call__` already takes named fields and returns logits trains
-with `processing_class=row -> example` (or `prepared=True`) and nothing else.
-Otherwise give it a bridge, either as a `model.asr_bridge(algorithm, config)`
-method or as one entry in `trainer/asr/models.py`:
+Each example runs through the model on its own and losses are averaged over
+the batch, so padding never changes an encoder's audio representation.
 
-```python
-ASRBridge(
-    process=lambda row: {...},                 # speech row -> example
-    forward=lambda model, mel: model.logits(mel),  # only if __call__ is not logits
-    blank_id=1024,                             # CTC only
-)
-```
-
-Notes: audio-LLM models merge audio features by placeholder position, so keep
-`batch_size=1` unless the model masks padded audio. Half-precision checkpoints
-need `--optimizer-eps 1e-4` (or SGD) for `--train-type full` with Adam/AdamW.
-Parakeet TDT/RNN-T transducer objectives are not implemented.
+Not covered yet: transducer objectives (Parakeet TDT/RNN-T, Nemotron ASR),
+Voxtral Realtime, Granite Speech NAR, LASR CTC, MiMo ASR, and MOSS Music.
+Half-precision checkpoints need `--optimizer-eps 1e-4` (or SGD) for
+`--train-type full` with Adam/AdamW.
 
 ## Backend structure and compatibility
 
@@ -456,7 +454,7 @@ Parakeet TDT/RNN-T transducer objectives are not implemented.
 callbacks, and the `TrainingTask` contract. `trainer/datasets/loading.py` owns
 JSONL loading and bounded caching. `trainer/vlm` owns VLM preprocessing and SFT,
 ORPO, and DPO objectives. `trainer/asr` owns the ASR objectives and model
-bridges. `trainer/peft` uses MLX-VLM's local LoRA/DoRA layers.
+normalization. `trainer/peft` uses MLX-VLM's local LoRA/DoRA layers.
 The registry in `trainer/api.py` selects the supported VLM tasks; a custom
 `TrainingTask` can be passed directly to `Trainer`.
 

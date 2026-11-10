@@ -41,8 +41,12 @@ def _parse_schedule(value):
 
 def build_parser(task="vlm", algorithm=None):
     """Generate training flags from the same dataclasses notebooks use."""
+    requested = algorithm
     algorithm, (_, config_type) = task_spec(task, algorithm)
     parser = argparse.ArgumentParser(description=f"MLX {task}/{algorithm} training")
+    if task == "asr":
+        # The loaded model names its objective unless one is requested.
+        algorithm = requested
     parser.add_argument("--task", choices=("vlm", "asr"), default=task)
     parser.add_argument(
         "--algorithm",
@@ -298,9 +302,9 @@ def _load_model(task, path):
     if task == "asr":
         from mlx_audio.stt import load
 
-        model = load(path)
-        # Some loaders return an inference facade around the trainable module.
-        return getattr(model, "_model", model), None
+        from .trainer.asr.normalize import normalize_model
+
+        return normalize_model(load(path)), None
     from mlx_vlm import load
 
     return load(path)

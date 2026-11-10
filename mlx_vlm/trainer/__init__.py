@@ -8,7 +8,6 @@ remain available through ``train``/``train_orpo`` and their object facades.
 
 from ..export import export_model
 from .api import Trainer
-from .asr import ASRBridge, CTCTrainConfig
 from .common.callbacks import TrainingCallback, WandBCallback
 from .common.config import BaseTrainConfig, CoreTrainingArgs
 from .common.model import prepare_model_for_training

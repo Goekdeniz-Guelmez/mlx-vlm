@@ -10,16 +10,23 @@ import numpy as np
 import pytest
 
 from mlx_vlm.train import parse_args
-from mlx_vlm.trainer import CTCTrainConfig, SFTTrainConfig, Trainer
-from mlx_vlm.trainer.asr.models import ASRBridge, get_bridge
+from mlx_vlm.trainer import SFTTrainConfig, Trainer
 from mlx_vlm.trainer.datasets.loading import RawSplit
 from mlx_vlm.trainer.losses.ctc import ctc_loss
 
 VOCAB, MELS = 6, 4
+SEEN = []  # (audio, language) pairs the model was asked to prepare
+
+
+def features(path):
+    seed = int(path.rsplit("/", 1)[-1].split(".")[0])
+    return mx.array(np.random.default_rng(seed).normal(size=(1, 6 + seed, MELS)))
 
 
 class TinyDecoder(nn.Module):
-    """Autoregressive ASR: named audio input, logits per token."""
+    """A model that defines the training interface itself (next-token)."""
+
+    training_objective = "sft"
 
     def __init__(self):
         super().__init__()
@@ -27,37 +34,56 @@ class TinyDecoder(nn.Module):
         self.audio = nn.Linear(MELS, 8)
         self.head = nn.Linear(8, VOCAB)
 
-    def __call__(self, input_ids, input_features=None):
+    def prepare_example(self, audio, text, language="en"):
+        SEEN.append((audio, language))
+        ids = [int(token) for token in text.split()]
+        return {
+            "input_ids": np.array([0, 5, *ids]),
+            "completion_mask": np.array([0, 0] + [1] * len(ids)),
+            "input_features": features(audio),
+        }
+
+    def forward_logits(self, input_ids, input_features):
         hidden = self.embedding(input_ids)
         return self.head(hidden + self.audio(input_features).mean(axis=1)[:, None])
 
 
 class TinyEncoder(nn.Module):
-    """Frame-synchronous ASR whose call is not a logits function."""
+    """A model that defines the training interface itself (CTC)."""
+
+    training_objective = "ctc"
+    blank_id = VOCAB - 1
 
     def __init__(self):
         super().__init__()
         self.layer = nn.Linear(MELS, VOCAB)
 
-    def logits(self, mel):
-        return self.layer(mel)
+    def prepare_example(self, audio, text, language="en"):
+        return {
+            "input_features": features(audio),
+            "labels": [int(token) for token in text.split()],
+        }
 
-    def asr_bridge(self, algorithm, config):
-        return ASRBridge(
-            process=lambda row: {
-                "mel": features(row["audio"]),
-                "input_lengths": row["frames"],
-                "labels": row["labels"],
-            },
-            forward=lambda model, mel: model.logits(mel),
-            blank_id=VOCAB - 1,
-        )
+    def forward_logits(self, input_features):
+        return self.layer(input_features)
 
 
-def features(path, frames=None):
-    seed = int(path.rsplit("/", 1)[-1].split(".")[0])
-    frames = frames or 6 + seed
-    return np.random.default_rng(seed).normal(size=(frames, MELS)).astype(np.float32)
+def rows(base_path=None):
+    texts = ["1 2", "1 2 3", "3", "2 1"]
+    return RawSplit(
+        [{"audio": f"audio/{i}.wav", "text": text} for i, text in enumerate(texts)],
+        base_path,
+    )
+
+
+def config(tmp_path, iters):
+    return SFTTrainConfig(
+        batch_size=2,
+        iters=iters,
+        steps_per_report=iters,
+        steps_per_eval=iters,
+        adapter_file=str(tmp_path / "adapters.safetensors"),
+    )
 
 
 def brute_force_ctc(log_probs, target, blank):
@@ -96,83 +122,45 @@ def test_ctc_loss_skips_targets_longer_than_their_frames():
 
 
 def test_asr_sft_trains_transcript_tokens_from_speech_rows(tmp_path):
-    seen = []
-
-    def process(row):
-        seen.append(row["audio"])
-        return {
-            "input_ids": np.array([0, 5, *row["ids"]]),
-            "completion_mask": np.array([0, 0] + [1] * len(row["ids"])),
-            "input_features": features(row["audio"], frames=8),
-        }
-
-    rows = RawSplit(
-        [{"audio": f"audio/{i}.wav", "ids": [1, 2, 3][: 2 + i % 2]} for i in range(4)],
-        tmp_path,
-    )
-    model = TinyDecoder()
+    SEEN.clear()
     trainer = Trainer(
-        model,
-        SFTTrainConfig(
-            batch_size=2,
-            iters=30,
-            steps_per_report=30,
-            steps_per_eval=30,
-            adapter_file=str(tmp_path / "adapters.safetensors"),
-        ),
+        TinyDecoder(),
+        config(tmp_path, 30),
         task="asr",
-        train_dataset=rows,
-        eval_dataset=rows,
-        processing_class=process,
+        train_dataset=rows(tmp_path),
+        eval_dataset=rows(tmp_path),
+        dataset_config={"language": "de"},
         optimizer=optim.Adam(learning_rate=0.05),
     )
     before = trainer.evaluate()
     metrics = trainer.train()
     assert metrics["val_loss"] < before["val_loss"]
     # Only transcript tokens are supervised; audio paths resolve to the dataset root.
-    assert before["val_num_tokens"] == 10
-    assert seen[0] == str(tmp_path / "audio/0.wav")
+    assert before["val_num_tokens"] == 8
+    assert SEEN[0] == (str(tmp_path / "audio/0.wav"), "de")
 
 
-def test_asr_ctc_trains_through_a_model_bridge(tmp_path):
-    rows = [
-        {"audio": f"{i}.wav", "frames": 6 + i, "labels": [1, 2, 3][: 1 + i % 3]}
-        for i in range(4)
-    ]
-    model = TinyEncoder()
+def test_asr_ctc_is_selected_by_the_model(tmp_path):
     trainer = Trainer(
-        model,
-        CTCTrainConfig(
-            batch_size=2,
-            iters=40,
-            steps_per_report=40,
-            steps_per_eval=40,
-            adapter_file=str(tmp_path / "adapters.safetensors"),
-        ),
+        TinyEncoder(),
+        config(tmp_path, 40),
         task="asr",
-        train_dataset=rows,
-        eval_dataset=rows,
+        train_dataset=rows(),
+        eval_dataset=rows(),
         optimizer=optim.Adam(learning_rate=0.05),
     )
-    batch = next(trainer.task.batches(trainer.eval_dataset))
-    assert batch["mel"].shape == (2, 7, MELS)
-    assert batch["labels"].tolist() == [[1, -100], [1, 2]]
     before = trainer.evaluate()
     metrics = trainer.train()
     assert metrics["val_loss"] < before["val_loss"]
     assert before["val_num_frames"] == 6 + 7 + 8 + 9
+    assert before["val_num_tokens"] == 8
 
 
-def test_models_without_a_bridge_need_a_processor():
-    assert get_bridge(TinyDecoder(), "sft") == ASRBridge()
-    with pytest.raises(ValueError, match="processing_class"):
-        Trainer(TinyDecoder(), task="asr", train_dataset=[{"audio": "a.wav"}])
+def test_requested_algorithm_must_match_the_model():
+    with pytest.raises(ValueError, match="trains with 'ctc'"):
+        Trainer(TinyEncoder(), task="asr", algorithm="sft", train_dataset=rows())
 
 
-def test_cli_selects_asr_algorithms():
-    args, settings = parse_args(
-        ["--model", "unused", "--task", "asr", "--algorithm", "ctc", "--blank-id", "7"]
-    )
-    assert isinstance(settings, CTCTrainConfig) and settings.blank_id == 7
-    _, settings = parse_args(["--model", "unused", "--task", "asr"])
-    assert isinstance(settings, SFTTrainConfig)
+def test_cli_leaves_the_asr_objective_to_the_model():
+    args, settings = parse_args(["--model", "unused", "--task", "asr"])
+    assert args.algorithm is None and isinstance(settings, SFTTrainConfig)

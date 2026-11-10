@@ -598,12 +598,8 @@ def make_task(
     *,
     loss_fn=vlm_sft_loss,
     iterate_batches=iterate_vlm_batches,
-    dataset_factory=None,
 ):
-    """Bind preprocessing and supervised cross-entropy.
-
-    ``dataset_factory(rows)`` replaces VLM preprocessing for other modalities.
-    """
+    """Bind VLM preprocessing and supervised cross-entropy."""
     from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
 
     loss_options = dict(
@@ -619,11 +615,8 @@ def make_task(
 
     return _make_vlm_task(
         args,
-        dataset_factory
-        or (
-            lambda rows: VisionDataset(
-                rows, model.config, processing_class, config=dataset_config or args
-            )
+        lambda rows: VisionDataset(
+            rows, model.config, processing_class, config=dataset_config or args
         ),
         loss_fn=partial(loss_fn, **loss_options),
         iterate_batches=iterate_batches,
